@@ -1,0 +1,13 @@
+{
+  "baseline_suite": {
+    "errors": 0,
+    "failures": 0,
+    "skipped": 1,
+    "tests": 992
+  },
+  "hidden_test_count": 74,
+  "hidden_tests": {
+    "tests/test_let.py": "c09b28454c6db602334181643c9feecceaa9ec784e0cfdf375ee2b890d42e81c"
+  },
+  "repo_commit": "2812594e69d43098ef60f81f4efc404c071b0418"
+}

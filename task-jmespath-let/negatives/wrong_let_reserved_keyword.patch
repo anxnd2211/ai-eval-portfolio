@@ -1,0 +1,224 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index dc673df..2692f48 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -1,7 +1,9 @@
+ Next Release (TBD)
+ ==================
+ 
+-* No changes yet.
++* Add lexical scoping: ``let $name = <expr>, ... in <expr>`` expressions and
++  ``$name`` variable references (JEP-11a). Referencing an unbound variable
++  raises the new ``jmespath.exceptions.UndefinedVariable`` at evaluation time.
+ 
+ 
+ 1.1.0
+diff --git a/jmespath/ast.py b/jmespath/ast.py
+index dd56c6e..adf8826 100644
+--- a/jmespath/ast.py
++++ b/jmespath/ast.py
+@@ -62,6 +62,20 @@ def or_expression(left, right):
+     return {"type": "or_expression", "children": [left, right]}
+ 
+ 
++def assign(name, expr):
++    # One ``$name = expr`` binding inside a let expression.
++    return {'type': 'assign', 'children': [expr], 'value': name}
++
++
++def let_expression(bindings, expr):
++    # children = [assign, assign, ..., body]
++    return {'type': 'let_expression', 'children': list(bindings) + [expr]}
++
++
++def variable_ref(name):
++    return {'type': 'variable_ref', 'children': [], 'value': name}
++
++
+ def and_expression(left, right):
+     return {"type": "and_expression", "children": [left, right]}
+ 
+diff --git a/jmespath/exceptions.py b/jmespath/exceptions.py
+index 0156015..a8b15ec 100644
+--- a/jmespath/exceptions.py
++++ b/jmespath/exceptions.py
+@@ -120,3 +120,14 @@ class EmptyExpressionError(JMESPathError):
+ 
+ class UnknownFunctionError(JMESPathError):
+     pass
++
++
++class UndefinedVariable(JMESPathError):
++    """A ``$name`` reference was evaluated with no binding in scope.
++
++    Raised at evaluation time (never at compile time), per JEP-11a.
++    """
++    def __init__(self, varname):
++        self.varname = varname
++        super(UndefinedVariable, self).__init__(
++            "Reference to undefined variable: $%s" % varname)
+diff --git a/jmespath/lexer.py b/jmespath/lexer.py
+index 8db05e3..11650f5 100644
+--- a/jmespath/lexer.py
++++ b/jmespath/lexer.py
+@@ -87,22 +87,12 @@ class Lexer(object):
+             elif self._current == '!':
+                 yield self._match_or_else('=', 'ne', 'not')
+             elif self._current == '=':
+-                if self._next() == '=':
+-                    yield {'type': 'eq', 'value': '==',
+-                        'start': self._position - 1, 'end': self._position}
+-                    self._next()
+-                else:
+-                    if self._current is None:
+-                        # If we're at the EOF, we never advanced
+-                        # the position so we don't need to rewind
+-                        # it back one location.
+-                        position = self._position
+-                    else:
+-                        position = self._position - 1
+-                    raise LexerError(
+-                        lexer_position=position,
+-                        lexer_value='=',
+-                        message="Unknown token '='")
++                # '==' is equality; a lone '=' is the assignment token used
++                # by let-expression bindings (JEP-11a).  Whether a lone '='
++                # is *valid* is decided by the parser, not the lexer.
++                yield self._match_or_else('=', 'eq', 'assign')
++            elif self._current == '$':
++                yield self._consume_variable()
+             else:
+                 raise LexerError(lexer_position=self._position,
+                                  lexer_value=self._current,
+@@ -110,6 +100,21 @@ class Lexer(object):
+         yield {'type': 'eof', 'value': '',
+                'start': self._length, 'end': self._length}
+ 
++    def _consume_variable(self):
++        # variable-ref = "$" unquoted-string  (JEP-11a)
++        start = self._position
++        buff = self._current
++        if self._next() not in self.START_IDENTIFIER:
++            raise LexerError(lexer_position=start,
++                             lexer_value='$',
++                             message="Bad token '$': expected a variable "
++                                     "name after '$'")
++        buff += self._current
++        while self._next() in self.VALID_IDENTIFIER:
++            buff += self._current
++        return {'type': 'variable', 'value': buff,
++                'start': start, 'end': start + len(buff)}
++
+     def _consume_number(self):
+         start = self._position
+         buff = self._current
+diff --git a/jmespath/parser.py b/jmespath/parser.py
+index cc8e804..0f68f53 100644
+--- a/jmespath/parser.py
++++ b/jmespath/parser.py
+@@ -46,6 +46,8 @@ class Parser(object):
+         'current': 0,
+         'expref': 0,
+         'colon': 0,
++        'variable': 0,
++        'assign': 0,
+         'pipe': 1,
+         'or': 2,
+         'and': 3,
+@@ -149,8 +151,45 @@ class Parser(object):
+         return ast.literal(token['value'])
+ 
+     def _token_nud_unquoted_identifier(self, token):
++        # ``let`` is a contextual keyword: it starts a let expression only
++        # when immediately followed by a variable binding, and is an
++        # ordinary field name everywhere else (JEP-11a).
++        if token['value'] == 'let':
++            return self._parse_let_expression()
+         return ast.field(token['value'])
+ 
++    def _token_nud_variable(self, token):
++        # Strip the leading '$'.
++        return ast.variable_ref(token['value'][1:])
++
++    def _parse_let_expression(self):
++        # We are here:   let $x = <expr> [, $y = <expr>]* in <expr>
++        #                    ^ current token
++        bindings = []
++        while True:
++            var_token = self._lookahead_token(0)
++            self._match('variable')
++            self._match('assign')
++            # Binding power 0: the binding expression stops at ',' and at
++            # the ``in`` identifier (both have binding power 0).
++            expression = self._expression(0)
++            bindings.append(ast.assign(var_token['value'][1:], expression))
++            if self._current_token() == 'comma':
++                self._advance()
++                continue
++            break
++        self._match_keyword('in')
++        body = self._expression(0)
++        return ast.let_expression(bindings, body)
++
++    def _match_keyword(self, keyword):
++        token = self._lookahead_token(0)
++        if token['type'] == 'unquoted_identifier' and \
++                token['value'] == keyword:
++            self._advance()
++        else:
++            self._raise_parse_error_maybe_eof(keyword, token)
++
+     def _token_nud_quoted_identifier(self, token):
+         field = ast.field(token['value'])
+         # You can't have a quoted identifier as a function
+diff --git a/jmespath/visitor.py b/jmespath/visitor.py
+index 15fb177..24a2958 100644
+--- a/jmespath/visitor.py
++++ b/jmespath/visitor.py
+@@ -1,5 +1,6 @@
+ import operator
+ 
++from jmespath import exceptions
+ from jmespath import functions
+ from jmespath.compat import string_type
+ from numbers import Number
+@@ -121,6 +122,10 @@ class TreeInterpreter(Visitor):
+             self._functions = self._options.custom_functions
+         else:
+             self._functions = functions.Functions()
++        # Stack of {name: value} dicts, innermost scope last (JEP-11a).
++        # A TreeInterpreter is created per search(), so the stack never
++        # leaks between evaluations.
++        self._scopes = []
+ 
+     def default_visit(self, node, *args, **kwargs):
+         raise NotImplementedError(node['type'])
+@@ -196,6 +201,28 @@ class TreeInterpreter(Visitor):
+                 merged_list.append(element)
+         return merged_list
+ 
++    def visit_let_expression(self, node, value):
++        *bindings, body = node['children']
++        # All binding expressions are evaluated against the *current* node
++        # and in the *enclosing* scope: the new scope is pushed only after
++        # every binding has been evaluated, so bindings cannot see their
++        # siblings.
++        scope = {}
++        for binding in bindings:
++            scope[binding['value']] = self.visit(binding['children'][0], value)
++        self._scopes.append(scope)
++        try:
++            return self.visit(body, value)
++        finally:
++            self._scopes.pop()
++
++    def visit_variable_ref(self, node, value):
++        name = node['value']
++        for scope in reversed(self._scopes):
++            if name in scope:
++                return scope[name]
++        raise exceptions.UndefinedVariable(name)
++
+     def visit_identity(self, node, value):
+         return value
+ 
