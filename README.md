@@ -49,7 +49,7 @@ gh repo create ai-eval-portfolio --public --source=. --push
 (`.github/workflows/validate.yml`) rebuilds the image and re-runs every check
 on each push; the badge below turns green on the first run.
 
-![validate task](https://github.com/OWNER/ai-eval-portfolio/actions/workflows/validate.yml/badge.svg)
+![validate task](https://github.com/anxnd2211/ai-eval-portfolio/actions/workflows/validate.yml/badge.svg)
 
 Hidden tests are public in this repo by design; the task is a portfolio piece,
 not a held-out benchmark (see `CALIBRATION.md`, "Why this task is public-spec'd").
